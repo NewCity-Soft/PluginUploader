@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plugin Uploader - New City Pulse</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script type="module">
+        import { Octokit } from "https://cdn.skypack.dev/@octokit/rest";
+
+        console.log('Plugin Uploader Module Loaded');
+
+        const CLIENT_ID = 'Ov23liDf9IeTPqBf8zX0';
+        // 自动计算 Redirect URI，确保在预览环境和正式环境都能工作
+        const getRedirectUri = () => {
+            const base = window.location.origin + window.location.pathname;
+            return base.substring(0, base.lastIndexOf('/') + 1) + 'callback.html';
+        };
+        const REDIRECT_URI = getRedirectUri();
+        console.log('REDIRECT_URI:', REDIRECT_URI);
+
+        const REPO_OWNER = 'NewCity-Soft';
+        const REPO_NAME = 'NewCityPulsePlugins';
+        
+        let githubToken = localStorage.getItem('gh_token');
+        let user = null;
+        let selectedFiles = []; // Array of { path, content }
+
+        const el = (id) => document.getElementById(id);
+
+        // -- File Processing --
+        async function processFile(file, pathPrefix = '') {
+            const path = pathPrefix + (file.webkitRelativePath || file.name);
+            
+            if (file.name.endsWith('.zip')) {
+                const zip = new JSZip();
+                const contents = await zip.loadAsync(file);
+                for (const [relativePath, zipEntry] of Object.entries(contents.files)) {
+                    if (!zipEntry.dir) {
+                        const content = await zipEntry.async('text');
+                        addToFileList(relativePath, content);
+                    }
+                }
+            } else {
+                const content = await file.text();
+                addToFileList(path, content);
+            }
+        }
+
+        function addToFileList(path, content) {
+            // Remove prefix if it exists to keep paths relative to plugin root
+            const cleanPath = path.replace(/^.*[\\\/]/, '');
+            
+            // If it's a manifest.json, try to auto-fill
+            if (path.endsWith('manifest.json')) {
+                try {
+                    const meta = JSON.parse(content);
+                    if (meta.name) el('p-name').value = meta.name;
+                    if (meta.id) el('p-id').value = meta.id;
+                    if (meta.version) el('p-version').value = meta.version;
+                    if (meta.description) el('p-desc').value = meta.description;
+                    if (meta.author) el('p-author').value = meta.author;
+                } catch(e) { console.warn('Failed to parse uploaded manifest', e); }
+            }
+
+            selectedFiles.push({ path, content });
+            renderFileList();
+            checkReady();
+        }
+
+        function renderFileList() {
+            const listContainer = el('file-list');
+            const status = el('file-status');
+            const dropZone = el('drop-zone');
+
+            if (selectedFiles.length > 0) {
+                dropZone.classList.add('hidden');
+                status.classList.remove('hidden');
+                listContainer.innerHTML = selectedFiles.map((f, i) => `
+                    <div class="flex items-center justify-between p-2 bg-white rounded-lg border border-slate-100 mb-2">
+                        <span class="text-[10px] font-mono text-slate-500 truncate mr-4">${f.path}</span>
+                        <button onclick="removeFile(${i})" class="text-rose-500 hover:text-rose-700">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" /></svg>
+                        </button>
+                    </div>
+                `).join('');
+            } else {
+                dropZone.classList.remove('hidden');
+                status.classList.add('hidden');
+            }
+        }
+
+        window.removeFile = (index) => {
+            selectedFiles.splice(index, 1);
+            renderFileList();
+            checkReady();
+        };
+
+        el('remove-all').onclick = () => {
+            selectedFiles = [];
+            el('file-input').value = '';
+            el('folder-input').value = '';
+            renderFileList();
+            checkReady();
+        };
+
+        // -- Auth Logic --
+        el('login-btn').onclick = () => {
+            console.log('Login button clicked. Auth URL:', `https://github.com/login/oauth/authorize?client_id=${CLIENT_ID}&scope=public_repo&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`);
+            const authUrl = `https://github.com/login/oauth/authorize?client_id=${CLIENT_ID}&scope=public_repo&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+            window.location.href = authUrl;
+        };
+
+        el('logout-btn').onclick = () => {
+            localStorage.removeItem('gh_token');
+            window.location.reload();
+        };
+
+        // 监听来自 callback.html 的消息 (支持弹出窗口)
+        window.addEventListener('message', async (event) => {
+            if (event.data.type === 'GITHUB_AUTH_CODE' && event.data.code) {
+                console.log('Received code via message:', event.data.code);
+                await handleAuthCode(event.data.code);
+            }
+        });
+
+        const handleAuthCode = async (code) => {
+            console.log('Starting handleAuthCode with code:', code.substring(0, 5) + '...');
+            const loginBtn = el('login-btn');
+            const status = el('status-msg');
+            loginBtn.disabled = true;
+            loginBtn.innerText = '正在验证身份...';
+            if (status) status.innerText = '正在通过中转服务器换取 Token...';
+
+            try {
+                // 使用 Netlify Functions 路径
+                const GATEKEEPER_URL = '/.netlify/functions/token'; 
+                console.log('Fetching:', GATEKEEPER_URL);
+                
+                const response = await fetch(GATEKEEPER_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code, redirect_uri: REDIRECT_URI })
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    console.error('Gatekeeper error response:', errorText);
+                    throw new Error(`Gatekeeper error (${response.status}): ${errorText}`);
+                }
+
+                const data = await response.json();
+                console.log('Gatekeeper response data:', data);
+                
+                if (data.access_token) {
+                    console.log('Success! Token received.');
+                    localStorage.setItem('gh_token', data.access_token);
+                    window.location.reload();
+                } else {
+                    throw new Error(data.error_description || data.error || '无法获取 Access Token');
+                }
+            } catch (e) {
+                console.error('Auth Error Details:', e);
+                alert('自动换取 Token 失败: ' + e.message + '\n\n可能原因：\n1. Netlify 环境变量未正确配置\n2. Redirect URI 不匹配\n3. 请在弹出框中手动输入 Token 降级。');
+                
+                const pat = prompt('降级方案：请输入您的 GitHub Personal Access Token (Repo Scope):');
+                if (pat) {
+                    localStorage.setItem('gh_token', pat);
+                    window.location.reload();
+                }
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.innerText = '使用 GitHub 登录';
+            }
+        };
+
+        const checkUrlCode = async () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            let code = urlParams.get('code');
+            console.log('Checking for code in URL:', code ? 'Found' : 'Not found');
+            
+            if (!code) {
+                code = localStorage.getItem('gh_auth_code');
+                if (code) {
+                    console.log('Found code in localStorage:', code.substring(0, 5) + '...');
+                    localStorage.removeItem('gh_auth_code');
+                    window.history.replaceState({}, document.title, window.location.pathname);
+                }
+            } else {
+                window.history.replaceState({}, document.title, window.location.pathname);
+            }
+
+            if (code) {
+                await handleAuthCode(code);
+            }
+        };
+
+        async function initAuth() {
+            console.log('Initializing Auth...');
+            await checkUrlCode();
+            
+            if (githubToken) {
+                try {
+                    console.log('Validating stored token...');
+                    const octokit = new Octokit({ auth: githubToken });
+                    const { data } = await octokit.rest.users.getAuthenticated();
+                    user = data;
+                    console.log('User authenticated:', user.login);
+                    
+                    el('logged-out').classList.add('hidden');
+                    el('logged-in').classList.remove('hidden');
+                    el('form-section').classList.remove('hidden');
+                    
+                    el('user-avatar').src = user.avatar_url;
+                    el('user-name').innerText = user.login;
+                    el('p-author').value = user.login;
+                } catch (e) {
+                    console.error('Token validation failed:', e);
+                    localStorage.removeItem('gh_token');
+                    el('logged-out').classList.remove('hidden');
+                }
+            } else {
+                console.log('No token found, showing login button.');
+            }
+        }
+
+        // -- File Logic --
+        el('file-input').onchange = async (e) => {
+            for (const file of e.target.files) {
+                await processFile(file);
+            }
+        };
+
+        el('folder-input').onchange = async (e) => {
+            for (const file of e.target.files) {
+                await processFile(file);
+            }
+        };
+
+        function checkReady() {
+            const ready = el('p-name').value && el('p-id').value && selectedFiles.length > 0;
+            const btn = el('publish-btn');
+            if (btn) btn.disabled = !ready;
+        }
+
+        ['p-name', 'p-id', 'p-version', 'p-author'].forEach(id => {
+            const element = el(id);
+            if (element) element.oninput = checkReady;
+        });
+
+        // -- Publish Logic --
+        el('publish-btn').onclick = async () => {
+            const status = el('status-msg');
+            const btn = el('publish-btn');
+            
+            try {
+                btn.disabled = true;
+                status.innerText = '正在准备 PR 环境...';
+                
+                const octokit = new Octokit({ auth: githubToken });
+                const pluginId = el('p-id').value.trim().replace(/[^a-z0-9-]/gi, '-');
+                const branchName = `plugin-${pluginId}-${Date.now()}`;
+                
+                status.innerText = '正在分叉仓库...';
+                await octokit.rest.repos.createFork({ owner: REPO_OWNER, repo: REPO_NAME });
+                
+                status.innerText = '正在同步状态 (约3秒)...';
+                await new Promise(r => setTimeout(r, 3000));
+                
+                const { data: refData } = await octokit.rest.git.getRef({ owner: user.login, repo: REPO_NAME, ref: 'heads/main' });
+                await octokit.rest.git.createRef({ 
+                    owner: user.login, 
+                    repo: REPO_NAME, 
+                    ref: `refs/heads/${branchName}`, 
+                    sha: refData.object.sha 
+                });
+
+                status.innerText = '正在构建插件包...';
+                
+                // 自动补全 manifest.json 如果列表里没有
+                const hasManifest = selectedFiles.some(f => f.path.endsWith('manifest.json'));
+                if (!hasManifest) {
+                    const manifest = {
+                        name: el('p-name').value,
+                        id: pluginId,
+                        version: el('p-version').value,
+                        description: el('p-desc').value,
+                        author: el('p-author').value,
+                        entry: 'index.tsx' // 默认值
+                    };
+                    selectedFiles.push({ path: 'manifest.json', content: JSON.stringify(manifest, null, 2) });
+                }
+
+                status.innerText = `正在上传文件 (共 ${selectedFiles.length} 个)...`;
+                
+                for (const f of selectedFiles) {
+                    // 规范化路径：移除领先斜杠，统一使用正斜杠，并保留子目录结构
+                    const relativePath = f.path.replace(/^[\\\/]+/, '').replace(/\\/g, '/');
+                    const targetPath = `plugins/${pluginId}/${relativePath}`;
+                    
+                    await octokit.rest.repos.createOrUpdateFileContents({
+                        owner: user.login,
+                        repo: REPO_NAME, // 保持使用正确的仓库名称
+                        path: targetPath,
+                        message: `Add ${relativePath} for plugin ${pluginId}`,
+                        content: btoa(unescape(encodeURIComponent(f.content))),
+                        branch: branchName
+                    });
+                }
+
+                status.innerText = '正在创建拉取请求...';
+                const pr = await octokit.rest.pulls.create({
+                    owner: REPO_OWNER,
+                    repo: REPO_NAME,
+                    title: `New Plugin: ${el('p-name').value}`,
+                    head: `${user.login}:${branchName}`,
+                    base: 'main',
+                    body: `Submitted via Plugin Uploader.\n\nAuthor: ${el('p-author').value}\nID: ${pluginId}\nVersion: ${el('p-version').value}\nFiles count: ${selectedFiles.length}`
+                });
+
+                status.className = 'text-center text-xs font-black text-emerald-500 uppercase mt-4';
+                status.innerText = '发布成功！PR 已创建。';
+                alert('提交成功！PR 地址: ' + pr.data.html_url);
+                
+            } catch (e) {
+                console.error(e);
+                status.className = 'text-center text-xs font-black text-rose-500 uppercase mt-4';
+                status.innerText = '发布失败: ' + (e.message || '未知错误');
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        // 启动
+        initAuth();
+    </script>
+</head>
+<body class="bg-slate-50 text-slate-900 font-sans antialiased">
+    <div id="app" class="max-w-3xl mx-auto py-12 px-6">
+        <!-- Header -->
+        <header class="mb-12 text-center">
+            <h1 class="text-4xl font-black text-slate-900 tracking-tight mb-2">PLUGIN UPLOADER</h1>
+            <p class="text-slate-500 font-medium">上传您的创作到 New City Pulse 官方商店</p>
+        </header>
+
+        <!-- Section -->
+        <div id="auth-section" class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm mb-8">
+            <div id="logged-out" class="text-center">
+                <p class="mb-6 text-slate-600">开始前，请先连接您的 GitHub 账号以提交 Pull Request。</p>
+                <button id="login-btn" class="inline-flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-6 py-3 rounded-2xl font-bold transition-all active:scale-95">
+                    <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd" /></svg>
+                    使用 GitHub 登录
+                </button>
+            </div>
+            <div id="logged-in" class="hidden flex items-center justify-between">
+                <div class="flex items-center gap-4">
+                    <img id="user-avatar" class="w-12 h-12 rounded-full border-2 border-slate-100" src="" alt="Avatar">
+                    <div>
+                        <p id="user-name" class="font-bold text-slate-900"></p>
+                        <p class="text-xs text-slate-500">已授权提交插件</p>
+                    </div>
+                </div>
+                <button id="logout-btn" class="text-xs font-bold text-rose-500 hover:underline uppercase tracking-widest">退出</button>
+            </div>
+        </div>
+
+        <!-- Form Section -->
+        <div id="form-section" class="hidden space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <!-- Step 1: Manifest -->
+            <section class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+                <h2 class="text-lg font-black mb-6 flex items-center gap-2">
+                    <span class="w-6 h-6 rounded-full bg-sky-500 text-white text-[10px] flex items-center justify-center italic font-black">01</span>
+                    配置清单 (manifest.json)
+                </h2>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">插件名称</label>
+                        <input id="p-name" type="text" placeholder="例如: 高级建筑包" class="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-sky-500 outline-none transition-all">
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">唯一 ID (英文字母)</label>
+                        <input id="p-id" type="text" placeholder="例如: advanced-buildings" class="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-sky-500 outline-none transition-all">
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">版本号</label>
+                        <input id="p-version" type="text" value="1.0.0" class="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-sky-500 outline-none transition-all">
+                    </div>
+                    <div class="space-y-2">
+                        <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">作者名称</label>
+                        <input id="p-author" type="text" class="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-sky-500 outline-none transition-all">
+                    </div>
+                    <div class="md:col-span-2 space-y-2">
+                        <label class="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">插件描述</label>
+                        <textarea id="p-desc" rows="2" class="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-2xl focus:ring-2 focus:ring-sky-500 outline-none transition-all resize-none"></textarea>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step : Source Code -->
+            <section class="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm">
+                <h2 class="text-lg font-black mb-6 flex items-center gap-2">
+                    <span class="w-6 h-6 rounded-full bg-sky-500 text-white text-[10px] flex items-center justify-center italic font-black">02</span>
+                    插件源码 (支持 ZIP / 文件夹 / 多文件)
+                </h2>
+                <div class="space-y-4">
+                    <div id="drop-zone" class="border-2 border-dashed border-slate-100 rounded-3xl p-12 text-center hover:border-sky-200 hover:bg-sky-50/30 transition-all cursor-pointer group">
+                        <div class="w-16 h-16 bg-slate-50 rounded-2xl flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
+                            <svg class="w-8 h-8 text-slate-300 group-hover:text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+                        </div>
+                        <p class="text-sm text-slate-400 font-medium mb-4">拖拽或点击上传 (ZIP 或 多个文件)</p>
+                        <div class="flex items-center justify-center gap-4">
+                            <button onclick="document.getElementById('file-input').click()" class="text-[10px] font-black bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-xl uppercase tracking-widest transition-colors">选择文件</button>
+                            <button onclick="document.getElementById('folder-input').click()" class="text-[10px] font-black bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-xl uppercase tracking-widest transition-colors">上传文件夹</button>
+                        </div>
+                        <input id="file-input" type="file" multiple accept=".tsx,.ts,.js,.jsx,.json,.css,.zip" class="hidden">
+                        <input id="folder-input" type="file" webkitdirectory directory class="hidden">
+                    </div>
+                    <div id="file-status" class="hidden p-6 bg-slate-50 rounded-3xl border border-slate-100">
+                        <div class="flex items-center justify-between mb-4">
+                            <span class="text-xs font-black text-slate-900 uppercase tracking-widest">待上传清单</span>
+                            <button id="remove-all" class="text-[10px] font-black text-rose-500 uppercase tracking-widest hover:underline">全部清空</button>
+                        </div>
+                        <style>
+                            .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+                            .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+                            .custom-scrollbar::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+                        </style>
+                        <div id="file-list" class="max-h-48 overflow-y-auto pr-2 custom-scrollbar">
+                            <!-- Files will be listed here -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Step 3: Publish -->
+            <div class="flex flex-col gap-4">
+                <button id="publish-btn" disabled class="w-full bg-sky-500 disabled:bg-slate-200 disabled:cursor-not-allowed hover:bg-sky-600 text-white py-4 rounded-3xl font-black text-lg shadow-xl shadow-sky-500/20 transition-all active:scale-[0.98]">
+                    确认并提交 Pull Request
+                </button>
+                <p id="status-msg" class="text-center text-xs font-medium text-slate-400"></p>
+            </div>
+        </div>
+    </div>
+
+
+</body>
+</html>
